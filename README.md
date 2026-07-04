@@ -219,4 +219,4 @@ mpremote exec "import shrike; shrike.flash('FPGA_bitstream_FLASH_MEM.bin')"
 
 
 ## Author
-Mohammed Hasan Rizvi — B.Tech ECE, 4th Year, USICT, GGSIPU
+MHR, ECE'27
