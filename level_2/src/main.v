@@ -1,99 +1,137 @@
-#include <Arduino.h>
-#include <EEPROM.h>
-#include <SPI.h>
-#include <Shrike.h>
+// ============================================================================
+// Module      : top
+// Description : Level 2 motion coprocessor. RP2040 sends 4-byte SPI commands
+//               (CMD, TARGET_HI, TARGET_LO, DIR_FLAGS) as 4 single-byte
+//               transactions. FPGA's accel_ramp continuously ramps toward
+//               the committed target. FPGA replies each byte with ACK,
+//               RAMPED_HI, RAMPED_LO, STATUS respectively.
+//
+//               Key: rx_valid_w from spi_target stays HIGH for ~25 FPGA
+//               clocks (one SCK half-period at 1 MHz SPI / 50 MHz FPGA),
+//               not 1 clock as originally assumed. This RTL edge-detects
+//               rx_valid_w so state advances exactly once per received byte.
+//               Bug caught via iverilog + gtkwave simulation.
+//
+// Author      : MHR
+// Project     : FPGA Balance Bot — Level 2 Motion Coprocessor
+// ============================================================================
 
-ShrikeFlash fpga;
+(* top *) module top (
+    (* iopad_external_pin, clkbuf_inhibit *) input  clk_i,
+    (* iopad_external_pin *)                 output clk_en_o,
+    (* iopad_external_pin *)                 input  rst_ni,
 
-const int SCK_PIN  = 2;
-const int MOSI_PIN = 3;
-const int MISO_PIN = 0;
-const int CS_PIN   = 1;
-const int RST_PIN  = 14;
+    (* iopad_external_pin *) input  spi_ss_ni,
+    (* iopad_external_pin *) input  spi_sck_i,
+    (* iopad_external_pin *) input  spi_mosi_i,
+    (* iopad_external_pin *) output spi_miso_o,
+    (* iopad_external_pin *) output spi_miso_en_o,
 
-const uint8_t CMD_START = 0xA5;
+    (* iopad_external_pin *) output reg led_o,
+    (* iopad_external_pin *) output     led_en_o
+);
 
-uint16_t test_targets[] = {5000, 0, 20000, 100};
-int      target_idx = 0;
+    assign clk_en_o = 1'b1;
+    assign led_en_o = 1'b1;
 
-uint8_t spi_byte(uint8_t tx_byte) {
-  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(CS_PIN, LOW);
-  delayMicroseconds(10);
-  uint8_t rx = SPI.transfer(tx_byte);
-  delayMicroseconds(10);
-  digitalWrite(CS_PIN, HIGH);
-  SPI.endTransaction();
-  delayMicroseconds(50);
-  return rx;
-}
+    localparam [7:0] ACK_OK = 8'hA5;
 
-uint16_t send_motion_command(uint16_t target, uint8_t direction, uint8_t &status_out) {
-  uint8_t r0 = spi_byte(CMD_START);
-  uint8_t r1 = spi_byte((target >> 8) & 0xFF);
-  uint8_t r2 = spi_byte(target & 0xFF);
-  uint8_t r3 = spi_byte(direction & 0x01);
+    localparam [1:0] S_IDLE     = 2'd0;
+    localparam [1:0] S_WAIT_HI  = 2'd1;
+    localparam [1:0] S_WAIT_LO  = 2'd2;
+    localparam [1:0] S_WAIT_DIR = 2'd3;
 
-  Serial.print("  replies: 0x");
-  if (r0 < 0x10) Serial.print("0"); Serial.print(r0, HEX); Serial.print(" 0x");
-  if (r1 < 0x10) Serial.print("0"); Serial.print(r1, HEX); Serial.print(" 0x");
-  if (r2 < 0x10) Serial.print("0"); Serial.print(r2, HEX); Serial.print(" 0x");
-  if (r3 < 0x10) Serial.print("0"); Serial.print(r3, HEX);
-  Serial.println();
+    wire rst_ah_w = ~rst_ni;
 
-  uint16_t ramped = ((uint16_t)r1 << 8) | r2;
-  status_out = r3;
-  return ramped;
-}
+    wire [7:0]  rx_data_w;
+    wire        rx_valid_w;
+    wire        tx_hold_w;
+    reg  [7:0]  tx_data_r;
 
-void setup() {
-  delay(2000);
-  Serial.begin(115200);
-  while (!Serial) delay(10);
+    wire [19:0] current_limit_w;
 
-  Serial.println();
-  Serial.println("=== Level 2: Motion Coprocessor ===");
+    reg [1:0]   state_r;
+    reg [7:0]   target_hi_r;
+    reg [7:0]   target_lo_r;
+    reg [15:0]  target_rate_r;
+    reg         direction_r;
 
-  if (!fpga.begin()) {
-    Serial.println("FPGA init failed!");
-    while (1) delay(1000);
-  }
-  Serial.print("Flashing FPGA..");
-  fpga.flash("/level2.bin");
-  Serial.println(" done.");
+    wire at_target_w = (current_limit_w[15:0] == target_rate_r);
 
-  pinMode(RST_PIN, OUTPUT);
-  digitalWrite(RST_PIN, HIGH); delay(100);
-  digitalWrite(RST_PIN, LOW);  delay(500);
-  digitalWrite(RST_PIN, HIGH); delay(500);
+    reg  rx_valid_prev_r;
+    wire rx_valid_edge_w = rx_valid_w & ~rx_valid_prev_r;
 
-  pinMode(CS_PIN, OUTPUT);
-  digitalWrite(CS_PIN, HIGH);
-  SPI.setSCK(SCK_PIN);
-  SPI.setTX(MOSI_PIN);
-  SPI.setRX(MISO_PIN);
-  SPI.begin();
+    always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) rx_valid_prev_r <= 1'b0;
+        else         rx_valid_prev_r <= rx_valid_w;
+    end
 
-  Serial.println("SPI ready. Starting ramp tests.");
-  Serial.println();
-}
+    spi_target #(
+        .CPOL  (1'b0),
+        .CPHA  (1'b0),
+        .WIDTH (8),
+        .LSB   (1'b0)
+    ) u_spi_target (
+        .i_clk           (clk_i),
+        .i_rst_n         (rst_ni),
+        .i_enable        (1'b1),
+        .i_ss_n          (spi_ss_ni),
+        .i_sck           (spi_sck_i),
+        .i_mosi          (spi_mosi_i),
+        .o_miso          (spi_miso_o),
+        .o_miso_oe       (spi_miso_en_o),
+        .o_rx_data       (rx_data_w),
+        .o_rx_data_valid (rx_valid_w),
+        .i_tx_data       (tx_data_r),
+        .o_tx_data_hold  (tx_hold_w)
+    );
 
-void loop() {
-  uint16_t target = test_targets[target_idx];
-  Serial.print(">>> New target: "); Serial.println(target);
+    accel_ramp #(
+        .LIMIT_WIDTH (20),
+        .RATE_WIDTH  (21)
+    ) u_accel_ramp (
+        .clk_i           (clk_i),
+        .rst_i           (rst_ah_w),
+        .target_limit_i  ({4'b0, target_rate_r}),
+        .ramp_rate_i     (21'd50_000),
+        .current_limit_o (current_limit_w)
+    );
 
-  for (int i = 0; i < 30; i++) {
-    uint8_t status;
-    uint16_t ramped = send_motion_command(target, 0, status);
-    Serial.print("  ramped="); Serial.print(ramped);
-    Serial.print("  status=0x");
-    if (status < 0x10) Serial.print("0");
-    Serial.print(status, HEX);
-    Serial.print("  at_target=");
-    Serial.println(status & 0x01 ? "YES" : "no");
-    delay(200);
-  }
+    always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) begin
+            state_r       <= S_IDLE;
+            tx_data_r     <= ACK_OK;
+            target_hi_r   <= 8'd0;
+            target_lo_r   <= 8'd0;
+            target_rate_r <= 16'd0;
+            direction_r   <= 1'b0;
+            led_o         <= 1'b0;
+        end
+        else if (rx_valid_edge_w) begin
+            case (state_r)
+                S_IDLE: begin
+                    tx_data_r <= current_limit_w[15:8];
+                    state_r   <= S_WAIT_HI;
+                end
+                S_WAIT_HI: begin
+                    target_hi_r <= rx_data_w;
+                    tx_data_r   <= current_limit_w[7:0];
+                    state_r     <= S_WAIT_LO;
+                end
+                S_WAIT_LO: begin
+                    target_lo_r <= rx_data_w;
+                    tx_data_r   <= {7'b0, at_target_w};
+                    state_r     <= S_WAIT_DIR;
+                end
+                S_WAIT_DIR: begin
+                    target_rate_r <= {target_hi_r, target_lo_r};
+                    direction_r   <= rx_data_w[0];
+                    tx_data_r     <= ACK_OK;
+                    led_o         <= ~led_o;
+                    state_r       <= S_IDLE;
+                end
+            endcase
+        end
+    end
 
-  target_idx = (target_idx + 1) % 4;
-  delay(1000);
-}
+endmodule
